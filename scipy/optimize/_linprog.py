@@ -18,6 +18,7 @@ import numpy as np
 
 from ._optimize import OptimizeResult, OptimizeWarning
 from warnings import warn
+from ._linprog_cuopt import _linprog_cuopt
 from ._linprog_highs import _linprog_highs
 from ._linprog_ip import _linprog_ip
 from ._linprog_simplex import _linprog_simplex
@@ -35,8 +36,7 @@ __all__ = ['linprog', 'linprog_verbose_callback', 'linprog_terse_callback']
 __docformat__ = "restructuredtext en"
 
 LINPROG_METHODS = [
-    'simplex', 'revised simplex', 'interior-point', 'highs', 'highs-ds', 'highs-ipm'
-]
+    'simplex', 'revised simplex', 'interior-point', 'highs', 'highs-ds', 'highs-ipm', 'cuopt']
 
 
 def linprog_verbose_callback(res):
@@ -444,7 +444,7 @@ def linprog(c, A_ub=None, b_ub=None, A_eq=None, b_eq=None,
     these three method values.
 
     .. versionadded:: 1.6.0
-
+=
     Method :ref:`'interior-point' <optimize.linprog-interior-point>`
     uses the primal-dual path following algorithm
     as outlined in [4]_. This algorithm supports sparse constraint matrices and
@@ -626,7 +626,7 @@ def linprog(c, A_ub=None, b_ub=None, A_eq=None, b_eq=None,
 
     meth = method.lower()
     methods = {"highs", "highs-ds", "highs-ipm",
-               "simplex", "revised simplex", "interior-point"}
+               "simplex", "revised simplex", "interior-point", "cuopt"}
 
     if meth not in methods:
         raise ValueError(f"Unknown solver '{method}'")
@@ -635,7 +635,7 @@ def linprog(c, A_ub=None, b_ub=None, A_eq=None, b_eq=None,
         warning_message = "x0 is used only when method is 'revised simplex'. "
         warn(warning_message, OptimizeWarning, stacklevel=2)
 
-    if np.any(integrality) and not meth == "highs":
+    if np.any(integrality) and not meth in ["highs", "cuopt"]:
         integrality = None
         warning_message = ("Only `method='highs'` supports integer "
                            "constraints. Ignoring `integrality`.")
@@ -666,6 +666,20 @@ def linprog(c, A_ub=None, b_ub=None, A_eq=None, b_eq=None,
         sol['success'] = sol['status'] == 0
         return OptimizeResult(sol)
 
+    elif meth.startswith('cuopt'):
+        if callback is not None:
+            raise NotImplementedError("cuopt does not support the "
+                                      "callback interface.")
+        
+        sol = _linprog_cuopt(lp, solver_options)
+        
+        sol['status'], sol['message'] = (
+            _check_result(sol['x'], sol['fun'], sol['status'], sol['slack'],
+                          sol['con'], lp.bounds, tol, sol['message'],
+                          integrality))
+        sol['success'] = sol['status'] == 0
+        return OptimizeResult(sol)
+        
     warn(f"`method='{meth}'` is deprecated and will be removed in SciPy "
          "1.11.0. Please use one of the HiGHS solvers (e.g. "
          "`method='highs'`) in new code.", DeprecationWarning, stacklevel=2)

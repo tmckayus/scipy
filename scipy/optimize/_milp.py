@@ -1,16 +1,18 @@
+import os
 import warnings
 
 import numpy as np
 from numpy.exceptions import VisibleDeprecationWarning
 
-from scipy.sparse import csc_array, vstack, issparse
+from scipy.sparse import csc_array, csr_array, vstack, issparse
+from ._cuopt_milp import _cuopt_milp, cuopt_to_scipy
 from ._highspy._highs_wrapper import _highs_wrapper  # type: ignore[import-not-found,import-untyped]
 from ._constraints import LinearConstraint, Bounds
 from ._optimize import OptimizeResult
 from ._linprog_highs import _highs_to_scipy_status_message
 
 
-def _constraints_to_components(constraints):
+def _constraints_to_components(constraints, csr=False):
     """
     Convert sequence of constraints to a single set of components A, b_l, b_u.
 
@@ -49,7 +51,7 @@ def _constraints_to_components(constraints):
             except (TypeError, ValueError, VisibleDeprecationWarning):
                 # argument was not a tuple representing a LinearConstraint
                 pass
-
+            
     # Address cases 4/5
     for constraint in constraints:
         # if it's not a LinearConstraint or something that represents a
@@ -59,12 +61,16 @@ def _constraints_to_components(constraints):
                 constraint = LinearConstraint(*constraint)
             except TypeError as exc:
                 raise ValueError(message) from exc
-        As.append(csc_array(constraint.A))
+        if csr:
+            As.append(csr_array(constraint.A))
+        else:
+            As.append(csc_array(constraint.A))
         b_ls.append(np.atleast_1d(constraint.lb).astype(np.float64))
         b_us.append(np.atleast_1d(constraint.ub).astype(np.float64))
 
+
     if len(As) > 1:
-        A = vstack(As, format="csc")
+        A = vstack(As, format="csr" if csr else "csc")
         b_l = np.concatenate(b_ls)
         b_u = np.concatenate(b_us)
     else:  # avoid unnecessary copying
@@ -75,7 +81,7 @@ def _constraints_to_components(constraints):
     return A, b_l, b_u
 
 
-def _milp_iv(c, integrality, bounds, constraints, options):
+def _milp_iv(c, integrality, bounds, constraints, options, use_cuopt=False):
     # objective IV
     if issparse(c):
         raise ValueError("`c` must be a dense array.")
@@ -123,7 +129,7 @@ def _milp_iv(c, integrality, bounds, constraints, options):
         constraints = [LinearConstraint(np.empty((0, c.size)),
                                         np.empty((0,)), np.empty((0,)))]
     try:
-        A, b_l, b_u = _constraints_to_components(constraints)
+        A, b_l, b_u = _constraints_to_components(constraints, csr=use_cuopt)
     except ValueError as exc:
         message = ("`constraints` (or each element within `constraints`) must "
                    "be convertible into an instance of "
@@ -142,7 +148,7 @@ def _milp_iv(c, integrality, bounds, constraints, options):
     unsupported_options = set(options).difference(supported_options)
     if unsupported_options:
         message = (f"Unrecognized options detected: {unsupported_options}. "
-                   "These will be passed to HiGHS verbatim.")
+                   f"These will be passed to {'HiGHS' if not use_cuopt else 'cuOpt'} verbatim.")
         warnings.warn(message, RuntimeWarning, stacklevel=3)
     options_iv = {'log_to_console': options.pop("disp", False),
                   'mip_max_nodes': options.pop("node_limit", None)}
@@ -368,27 +374,52 @@ def milp(c, *, integrality=None, bounds=None, constraints=None, options=None):
     Other examples are given :ref:`in the tutorial <tutorial-optimize_milp>`.
 
     """
-    args_iv = _milp_iv(c, integrality, bounds, constraints, options)
+    use_cuopt = os.environ.get("SCIPY_MILP_USE_CUOPT", False) in (True, "True", "true")
+    
+    args_iv = _milp_iv(c, integrality, bounds, constraints, options, use_cuopt)
     c, integrality, lb, ub, indptr, indices, data, b_l, b_u, options = args_iv
 
-    highs_res = _highs_wrapper(c, indptr, indices, data, b_l, b_u,
-                               lb, ub, integrality, options)
+    if use_cuopt:
+        cuopt_res = _cuopt_milp(c, indptr, indices, data, b_l, b_u,
+                                lb, ub, integrality, options)
+        
+        res = {}
+        status, message = cuopt_to_scipy[cuopt_res.get_termination_status()]
+        res["status"] = status
+        res["message"] = message
+        res["success"] = (status == 0)
+        res["x"] = cuopt_res.get_primal_solution()
+        res["fun"] = cuopt_res.get_primal_objective()
 
-    res = {}
+        if cuopt_res.get_problem_category() == 0:
+            res["mip_gap"] = None
+            res["mip_dual_bound"] = None
+            res["mip_node_count"] = None
+        else:
+            st = cuopt_res.get_milp_stats()
+            res["mip_gap"] = st["mip_gap"]
+            res['mip_dual_bound'] = st["solution_bound"]
+            res['mip_node_count'] = None # not yet returned by cuopt
+    else:
+    
+        highs_res = _highs_wrapper(c, indptr, indices, data, b_l, b_u,
+                                   lb, ub, integrality, options)
 
-    # Convert to scipy-style status and message
-    highs_status = highs_res.get('status', None)
-    highs_message = highs_res.get('message', None)
-    status, message = _highs_to_scipy_status_message(highs_status,
-                                                     highs_message)
-    res['status'] = status
-    res['message'] = message
-    res['success'] = (status == 0)
-    x = highs_res.get('x', None)
-    res['x'] = np.array(x) if x is not None else None
-    res['fun'] = highs_res.get('fun', None)
-    res['mip_node_count'] = highs_res.get('mip_node_count', None)
-    res['mip_dual_bound'] = highs_res.get('mip_dual_bound', None)
-    res['mip_gap'] = highs_res.get('mip_gap', None)
+        res = {}
+
+        # Convert to scipy-style status and message
+        highs_status = highs_res.get('status', None)
+        highs_message = highs_res.get('message', None)
+        status, message = _highs_to_scipy_status_message(highs_status,
+                                                         highs_message)
+        res['status'] = status
+        res['message'] = message
+        res['success'] = (status == 0)
+        x = highs_res.get('x', None)
+        res['x'] = np.array(x) if x is not None else None
+        res['fun'] = highs_res.get('fun', None)
+        res['mip_node_count'] = highs_res.get('mip_node_count', None)
+        res['mip_dual_bound'] = highs_res.get('mip_dual_bound', None)
+        res['mip_gap'] = highs_res.get('mip_gap', None)
 
     return OptimizeResult(res)
